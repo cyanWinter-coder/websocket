@@ -233,9 +233,19 @@ func (c *Conn) write(typ MessageType, p []byte) error {
 // 123 bytes without splitting a rune. If it truncated the reason and the close
 // had no other error, Close returns an error wrapping ErrCloseReasonTruncated.
 func (c *Conn) Close(code StatusCode, reason string) error {
+	return c.CloseWithContext(context.Background(), code, reason)
+}
+
+// CloseWithContext is like Close but the passed context bounds how long it
+// waits for the peer to complete the close handshake.
+//
+// If the context expires first, the returned error wraps the context's error.
+// The browser does not expose a way to forcefully close the underlying
+// connection, so it closes whenever the browser's own timeout fires.
+func (c *Conn) CloseWithContext(ctx context.Context, code StatusCode, reason string) error {
 	// Browsers throw on a reason over 123 bytes and leave the connection open.
 	reason, truncErr := wireCloseReason(reason)
-	err := c.closeAndWait(code, reason)
+	err := c.closeAndWait(ctx, code, reason)
 	if err != nil {
 		return fmt.Errorf("failed to close WebSocket: %w", err)
 	}
@@ -251,7 +261,7 @@ func (c *Conn) CloseNow() error {
 	return c.Close(StatusGoingAway, "")
 }
 
-func (c *Conn) closeAndWait(code StatusCode, reason string) error {
+func (c *Conn) closeAndWait(ctx context.Context, code StatusCode, reason string) error {
 	c.closingMu.Lock()
 	defer c.closingMu.Unlock()
 
@@ -270,11 +280,15 @@ func (c *Conn) closeAndWait(code StatusCode, reason string) error {
 		return err
 	}
 
-	<-c.closed
-	if !c.closeWasClean {
-		return c.closeErr
+	select {
+	case <-c.closed:
+		if !c.closeWasClean {
+			return c.closeErr
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	return nil
 }
 
 // Subprotocol returns the negotiated subprotocol.

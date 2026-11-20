@@ -106,16 +106,29 @@ func CloseStatus(err error) StatusCode {
 //
 // Close will unblock all goroutines interacting with the connection once
 // complete.
+//
+// Use CloseWithContext to bound the handshake with a caller deadline.
 func (c *Conn) Close(code StatusCode, reason string) error {
+	return c.CloseWithContext(context.Background(), code, reason)
+}
+
+// CloseWithContext is like Close but the passed context bounds the entire
+// close handshake, replacing the default 5s write and 5s wait timeouts.
+//
+// If the context expires before the peer answers the close frame, the
+// underlying connection is closed and the returned error wraps the context's
+// error, so errors.Is reports true for context.DeadlineExceeded or
+// context.Canceled.
+func (c *Conn) CloseWithContext(ctx context.Context, code StatusCode, reason string) error {
 	ce, wireErr := wireCloseError(code, reason)
-	err := c.closeAndWait(ce)
+	err := c.closeAndWait(ctx, ce)
 	if err != nil {
 		return err
 	}
 	return wireErr
 }
 
-func (c *Conn) closeAndWait(ce CloseError) (err error) {
+func (c *Conn) closeAndWait(ctx context.Context, ce CloseError) (err error) {
 	defer errd.Wrap(&err, "failed to close WebSocket")
 
 	if c.casClosing() {
@@ -131,7 +144,12 @@ func (c *Conn) closeAndWait(ce CloseError) (err error) {
 		}
 	}()
 
-	err = c.closeHandshake(ce)
+	err = c.closeHandshake(ctx, ce)
+	if err != nil && ctx.Err() != nil {
+		// The context expiring caused the handshake to fail and the
+		// caller must be able to recognize it.
+		err = ctx.Err()
+	}
 
 	err2 := c.close()
 	if err == nil && err2 != nil {
@@ -173,23 +191,20 @@ func (c *Conn) CloseNow() (err error) {
 	return err
 }
 
-func (c *Conn) closeHandshake(ce CloseError) error {
-	err := c.writeClose(ce)
+func (c *Conn) closeHandshake(ctx context.Context, ce CloseError) error {
+	err := c.writeClose(ctx, ce)
 	if err != nil {
 		return err
 	}
 
-	err = c.waitCloseHandshake()
+	err = c.waitCloseHandshake(ctx)
 	if CloseStatus(err) != ce.Code {
 		return err
 	}
 	return nil
 }
 
-func (c *Conn) writeClose(ce CloseError) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
-	defer cancel()
-
+func (c *Conn) writeClose(ctx context.Context, ce CloseError) error {
 	err := c.writeControl(ctx, opClose, ce.bytes())
 	// If the connection closed as we're writing we ignore the error as we might
 	// have written the close frame, the peer responded and then someone else read it
@@ -200,9 +215,12 @@ func (c *Conn) writeClose(ce CloseError) error {
 	return nil
 }
 
-func (c *Conn) waitCloseHandshake() error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
-	defer cancel()
+func (c *Conn) waitCloseHandshake(ctx context.Context) error {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Second*5)
+		defer cancel()
+	}
 
 	err := c.readMu.lock(ctx)
 	if err != nil {
@@ -210,11 +228,9 @@ func (c *Conn) waitCloseHandshake() error {
 	}
 	defer c.readMu.unlock()
 
-	for i := int64(0); i < c.msgReader.payloadLength; i++ {
-		_, err := c.br.ReadByte()
-		if err != nil {
-			return err
-		}
+	err = c.discardPayload(ctx, c.msgReader.payloadLength)
+	if err != nil {
+		return err
 	}
 
 	for {
@@ -223,13 +239,27 @@ func (c *Conn) waitCloseHandshake() error {
 			return err
 		}
 
-		for i := int64(0); i < h.payloadLength; i++ {
-			_, err := c.br.ReadByte()
-			if err != nil {
-				return err
-			}
+		err = c.discardPayload(ctx, h.payloadLength)
+		if err != nil {
+			return err
 		}
 	}
+}
+
+// discardPayload reads and discards n payload bytes. It reads through
+// readFramePayload so that the ctx deadline closes the connection and
+// unblocks the read even when the peer stalls mid frame.
+func (c *Conn) discardPayload(ctx context.Context, n int64) error {
+	var buf [256]byte
+	for n > 0 {
+		m := min(n, int64(len(buf)))
+		_, err := c.readFramePayload(ctx, buf[:m])
+		if err != nil {
+			return err
+		}
+		n -= m
+	}
+	return nil
 }
 
 func (c *Conn) waitGoroutines() error {

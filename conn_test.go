@@ -982,3 +982,193 @@ func TestConnClosePropagation(t *testing.T) {
 		checkConnErrs(t, this, other)
 	})
 }
+
+func TestCloseWithContext(t *testing.T) {
+	t.Parallel()
+
+	t.Run("success", func(t *testing.T) {
+		tt, c1, c2 := newConnTest(t, nil, nil)
+
+		tt.goEchoLoop(c2)
+
+		ctx, cancel := context.WithTimeout(tt.ctx, time.Second*10)
+		defer cancel()
+		err := c1.CloseWithContext(ctx, websocket.StatusNormalClosure, "")
+		assert.Success(t, err)
+	})
+
+	t.Run("writeTimeout", func(t *testing.T) {
+		t.Parallel()
+
+		c1, c2 := wstest.Pipe(nil, nil)
+		defer c1.CloseNow()
+		defer c2.CloseNow()
+
+		// c2 never reads so even the close frame write stalls.
+		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*100)
+		defer cancel()
+		start := time.Now()
+		err := c1.CloseWithContext(ctx, websocket.StatusNormalClosure, "")
+		assert.ErrorIs(t, context.DeadlineExceeded, err)
+		if d := time.Since(start); d > 3*time.Second {
+			t.Fatalf("close took too long: %v", d)
+		}
+
+		// The connection is closed afterwards.
+		err = c1.Write(context.Background(), websocket.MessageText, []byte("x"))
+		assert.ErrorIs(t, net.ErrClosed, err)
+		err = c1.Ping(context.Background())
+		assert.ErrorIs(t, net.ErrClosed, err)
+		_, _, err = c1.Read(context.Background())
+		assert.ErrorIs(t, net.ErrClosed, err)
+	})
+
+	t.Run("waitTimeout", func(t *testing.T) {
+		t.Parallel()
+
+		serving := make(chan struct{})
+		handlerDone := make(chan struct{})
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defer close(handlerDone)
+			c, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer c.CloseNow()
+			// Never read so the peer's close frame is never answered.
+			<-serving
+		}))
+		defer s.Close()
+
+		c, _, err := websocket.Dial(context.Background(), s.URL, nil)
+		assert.Success(t, err)
+		defer c.CloseNow()
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*100)
+		defer cancel()
+		start := time.Now()
+		err = c.CloseWithContext(ctx, websocket.StatusNormalClosure, "")
+		assert.ErrorIs(t, context.DeadlineExceeded, err)
+		if d := time.Since(start); d > 3*time.Second {
+			t.Fatalf("close took too long: %v", d)
+		}
+
+		close(serving)
+		<-handlerDone
+	})
+
+	t.Run("canceled", func(t *testing.T) {
+		tt, c1, _ := newConnTest(t, nil, nil)
+		_ = tt
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		err := c1.CloseWithContext(ctx, websocket.StatusNormalClosure, "")
+		assert.ErrorIs(t, context.Canceled, err)
+
+		// The connection is closed afterwards.
+		err = c1.Write(context.Background(), websocket.MessageText, []byte("x"))
+		assert.ErrorIs(t, net.ErrClosed, err)
+	})
+
+	t.Run("concurrent", func(t *testing.T) {
+		t.Parallel()
+
+		c1, c2 := wstest.Pipe(nil, nil)
+		defer c1.CloseNow()
+		defer c2.CloseNow()
+
+		// c2 answers the close handshake.
+		c2read := xsync.Go(func() error {
+			for {
+				_, _, err := c2.Read(context.Background())
+				if err != nil {
+					return nil
+				}
+			}
+		})
+		defer func() { <-c2read }()
+
+		bytesWritten := c1.RecordBytesWritten()
+
+		errc1 := xsync.Go(func() error {
+			return c1.CloseWithContext(context.Background(), websocket.StatusNormalClosure, "")
+		})
+		errc2 := xsync.Go(func() error {
+			return c1.Close(websocket.StatusNormalClosure, "")
+		})
+
+		successes := 0
+		for _, err := range []error{<-errc1, <-errc2} {
+			if err == nil {
+				successes++
+			} else {
+				assert.ErrorIs(t, net.ErrClosed, err)
+			}
+		}
+		assert.Equal(t, "successful closes", 1, successes)
+
+		// Exactly one close frame was written: 2 byte header, 4 byte
+		// mask key and 2 byte status code.
+		assert.Equal(t, "bytes written", 8, *bytesWritten)
+	})
+
+	t.Run("dataDiscarded", func(t *testing.T) {
+		t.Parallel()
+
+		handlerDone := make(chan struct{})
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defer close(handlerDone)
+			c, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer c.CloseNow()
+			// The client must discard this data message during the close
+			// handshake before it sees the answering close frame.
+			if c.Write(r.Context(), websocket.MessageText, []byte("hello")) != nil {
+				return
+			}
+			_, _, _ = c.Read(r.Context())
+		}))
+		defer s.Close()
+
+		c, _, err := websocket.Dial(context.Background(), s.URL, nil)
+		assert.Success(t, err)
+		defer c.CloseNow()
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+		defer cancel()
+		err = c.CloseWithContext(ctx, websocket.StatusNormalClosure, "")
+		assert.Success(t, err)
+
+		<-handlerDone
+	})
+
+	t.Run("readUnblocked", func(t *testing.T) {
+		t.Parallel()
+
+		c1, c2 := wstest.Pipe(nil, nil)
+		defer c1.CloseNow()
+		defer c2.CloseNow()
+
+		// c2 is silent so the read blocks until the close deadline
+		// forces the connection closed.
+		readErr := xsync.Go(func() error {
+			_, _, err := c1.Read(context.Background())
+			return err
+		})
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*100)
+		defer cancel()
+		err := c1.CloseWithContext(ctx, websocket.StatusNormalClosure, "")
+		assert.ErrorIs(t, context.DeadlineExceeded, err)
+
+		select {
+		case err := <-readErr:
+			assert.ErrorIs(t, net.ErrClosed, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("read did not converge after close")
+		}
+	})
+}
